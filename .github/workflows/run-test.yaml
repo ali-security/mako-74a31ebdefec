@@ -1,25 +1,28 @@
 name: Run tests
 
 on:
-  # run on push in main or rel_* branches excluding changes are only on doc or example folders
-  push:
-    branches:
-      - main
-      - "rel_*"
-      # branches used to test the workflow
-      - "workflow_test_*"
-    paths-ignore:
-      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest selector passed to tox posargs"
+        required: false
+        default: ""
+
+# resolve every pip install against the package index as of the 1.2.4 release date
+env:
+  PIP_INDEX_URL: https://:2022-11-15T14:37:53.675556Z@time-machines-pypi.sealsecurity.io/
 
 jobs:
   run-test:
     name: ${{ matrix.python-version }}-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       # run this job using this matrix
       matrix:
         os:
-          - "ubuntu-latest"
+          # ubuntu-latest is now 26.04, for which actions/setup-python has no CPython 3.7-3.9
+          - "ubuntu-22.04"
           - "windows-latest"
           - "macos-latest"
         python-version:
@@ -34,6 +37,12 @@ jobs:
           - os: "windows-latest"
             python-version: "3.10"
 
+        include:
+          # no arm64 CPython 3.7 build exists for macOS; use the x64 build
+          - os: "macos-latest"
+            python-version: "3.7"
+            architecture: "x64"
+
       fail-fast: false
 
     # steps to run in each job. Some are github actions, others run shell commands
@@ -42,16 +51,56 @@ jobs:
         uses: actions/checkout@v2
 
       - name: Set up python
-        uses: actions/setup-python@v2
+        if: runner.os != 'macOS'
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
 
+      - name: Set up python (macOS x64, python.org installer under Rosetta)
+        if: runner.os == 'macOS' && matrix.architecture == 'x64'
+        run: |
+          curl -sSfLo "$RUNNER_TEMP/python.pkg" https://www.python.org/ftp/python/3.7.9/python-3.7.9-macosx10.9.pkg
+          sudo installer -pkg "$RUNNER_TEMP/python.pkg" -target /
+          PYBIN=/Library/Frameworks/Python.framework/Versions/3.7/bin
+          ln -sf "$PYBIN/python3" "$PYBIN/python"
+          ln -sf "$PYBIN/pip3" "$PYBIN/pip"
+          echo "$PYBIN" >> "$GITHUB_PATH"
+          "$PYBIN/python" -c "import sys, platform; print(sys.version, platform.machine())"
+
+      - name: Set up python (macOS arm64)
+        if: runner.os == 'macOS' && matrix.architecture != 'x64'
+        uses: MatteoH2O1999/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: ${{ matrix.architecture }}
+          cache-build: true
+          allow-build: allow
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade tox setuptools
+          pip install --upgrade tox "setuptools==65.5.1"
           pip list
 
       - name: Run tests
-        run: tox
+        run: tox -- ${{ inputs.test-filter }}
+
+      - name: Build sdist and wheel
+        if: matrix.os == 'ubuntu-22.04' && matrix.python-version == '3.10'
+        shell: bash
+        run: |
+          # setup.cfg sets tag_build = dev for development; drop it for the release build
+          sed -i '/tag_build = dev/d' setup.cfg
+          printf 'setuptools==65.5.1\nwheel==0.38.4\n' > "$RUNNER_TEMP/build-constraints.txt"
+          python -m pip install build
+          PIP_CONSTRAINT="$RUNNER_TEMP/build-constraints.txt" python -m build
+          ls -l dist
+
+      - name: Upload dist
+        if: matrix.os == 'ubuntu-22.04' && matrix.python-version == '3.10'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
